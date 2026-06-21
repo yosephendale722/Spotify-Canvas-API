@@ -9,6 +9,22 @@ const PORT = 3000;
 
 app.use('/api/canvas', canvasRoutes);
 
+app.get('/api/search', async (req, res) => {
+  const { q } = req.query;
+  if (!q) return res.status(400).json({ error: 'Missing q param' });
+  try {
+    const token = await getAccessToken(); // same function the canvas route uses
+    const response = await fetch(
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(q)}&type=track&limit=5`,
+      { headers: { 'Authorization': `Bearer ${token}` } }
+    );
+    const data = await response.json();
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.listen(PORT, function () {
     console.log("Listening on PORT: ", PORT);
     if (PORT == 3000) { 
