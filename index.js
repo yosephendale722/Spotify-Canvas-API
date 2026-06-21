@@ -10,7 +10,6 @@ const PORT = 3000;
 
 app.use('/api/canvas', canvasRoutes);
 
-// Simple in-memory search cache (server-side)
 const searchCache = new Map();
 const SEARCH_CACHE_TTL = 1000 * 60 * 60 * 24; // 24 hours
 
@@ -26,47 +25,75 @@ app.get('/api/search', async (req, res) => {
   }
 
   try {
-    const token = await getToken();
-    if (!token) {
-      console.error('Search: getToken() returned null/undefined');
-      return res.status(500).json({ error: 'Failed to get Spotify token' });
+    // Use MusicBrainz to find the Spotify track ID — completely free, no auth needed
+    const encoded = encodeURIComponent(q);
+    const mbUrl = `https://musicbrainz.org/ws/2/recording/?query=${encoded}&limit=5&fmt=json`;
+
+    const mbResponse = await axios.get(mbUrl, {
+      headers: {
+        // MusicBrainz requires a User-Agent identifying your app
+        'User-Agent': 'Noog/1.0 ( noog@example.com )'
+      }
+    });
+
+    const recordings = mbResponse.data?.recordings;
+    if (!recordings || recordings.length === 0) {
+      return res.status(404).json({ error: 'No results found' });
     }
 
-    // Small delay to avoid hammering Spotify
-    await new Promise(resolve => setTimeout(resolve, 500));
+    // Find the first recording that has a Spotify URL relation
+    let spotifyTrackId = null;
+    for (const recording of recordings) {
+      const relations = recording['url-rels'] || [];
+      for (const rel of relations) {
+        const url = rel.url?.resource || '';
+        if (url.includes('open.spotify.com/track/')) {
+          spotifyTrackId = url.split('/track/')[1].split('?')[0];
+          break;
+        }
+      }
+      if (spotifyTrackId) break;
+    }
 
-    const response = await axios.get(
-      `https://api.spotify.com/v1/search?q=${encodeURIComponent(q)}&type=track&limit=5`,
-      { headers: { 'Authorization': `Bearer ${token}` } }
-    );
-
-    // Cache the result
-    searchCache.set(q, { data: response.data, expiresAt: Date.now() + SEARCH_CACHE_TTL });
-    console.log('Search: success for:', q);
-    res.json(response.data);
-
-  } catch (e) {
-    const status = e.response?.status;
-    console.error('Search endpoint error:', status, e.message);
-
-    // If rate limited, wait and retry once
-    if (status === 429) {
-      console.log('Rate limited, retrying after 2s...');
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      try {
-        const token2 = await getToken();
-        const retry = await axios.get(
-          `https://api.spotify.com/v1/search?q=${encodeURIComponent(q)}&type=track&limit=5`,
-          { headers: { 'Authorization': `Bearer ${token2}` } }
-        );
-        searchCache.set(q, { data: retry.data, expiresAt: Date.now() + SEARCH_CACHE_TTL });
-        return res.json(retry.data);
-      } catch (e2) {
-        console.error('Retry also failed:', e2.response?.status, e2.message);
-        return res.status(429).json({ error: 'Rate limited by Spotify, try again later' });
+    // MusicBrainz basic search doesn't include url-rels, so fetch the first recording's details
+    if (!spotifyTrackId && recordings[0]?.id) {
+      const detailUrl = `https://musicbrainz.org/ws/2/recording/${recordings[0].id}?inc=url-rels&fmt=json`;
+      const detailResponse = await axios.get(detailUrl, {
+        headers: { 'User-Agent': 'Noog/1.0 ( noog@example.com )' }
+      });
+      const relations = detailResponse.data?.relations || [];
+      for (const rel of relations) {
+        const url = rel.url?.resource || '';
+        if (url.includes('open.spotify.com/track/')) {
+          spotifyTrackId = url.split('/track/')[1].split('?')[0];
+          break;
+        }
       }
     }
 
+    if (!spotifyTrackId) {
+      console.log('No Spotify ID found on MusicBrainz for:', q);
+      return res.status(404).json({ error: 'No Spotify track ID found' });
+    }
+
+    console.log('MusicBrainz found Spotify track ID:', spotifyTrackId, 'for:', q);
+
+    // Return in same format as Spotify search so the Android app needs no changes
+    const result = {
+      tracks: {
+        items: [{
+          id: spotifyTrackId,
+          name: recordings[0]?.title || '',
+          artists: [{ name: recordings[0]?.['artist-credit']?.[0]?.name || '' }]
+        }]
+      }
+    };
+
+    searchCache.set(q, { data: result, expiresAt: Date.now() + SEARCH_CACHE_TTL });
+    res.json(result);
+
+  } catch (e) {
+    console.error('Search endpoint error:', e.response?.status, e.message);
     res.status(500).json({ error: e.message });
   }
 });
