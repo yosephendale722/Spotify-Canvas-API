@@ -17,7 +17,6 @@ app.get('/api/search', async (req, res) => {
   const { q } = req.query;
   if (!q) return res.status(400).json({ error: 'Missing q param' });
 
-  // Check cache first
   const cached = searchCache.get(q);
   if (cached && Date.now() < cached.expiresAt) {
     console.log('Search cache hit for:', q);
@@ -25,66 +24,55 @@ app.get('/api/search', async (req, res) => {
   }
 
   try {
-    // Use MusicBrainz to find the Spotify track ID — completely free, no auth needed
-    const encoded = encodeURIComponent(q);
-    const mbUrl = `https://musicbrainz.org/ws/2/recording/?query=${encoded}&limit=5&fmt=json`;
+    const token = await getToken();
+    if (!token) return res.status(500).json({ error: 'Failed to get token' });
 
-    const mbResponse = await axios.get(mbUrl, {
+    const variables = encodeURIComponent(JSON.stringify({
+      searchTerm: q,
+      offset: 0,
+      limit: 5,
+      numberOfTopResults: 1,
+      includeAudiobooks: false
+    }));
+
+    const extensions = encodeURIComponent(JSON.stringify({
+      persistedQuery: {
+        version: 1,
+        sha256Hash: "7a60179c5d6b4171c7c28f1c574e4491b0c4f38d3c3b9c3b2f7a02aef38deae"
+      }
+    }));
+
+    const url = `https://api-partner.spotify.com/pathfinder/v1/query?operationName=searchDesktop&variables=${variables}&extensions=${extensions}`;
+
+    const response = await axios.get(url, {
       headers: {
-        // MusicBrainz requires a User-Agent identifying your app
-        'User-Agent': 'Noog/1.0 ( noog@example.com )'
+        'Authorization': `Bearer ${token}`,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Origin': 'https://open.spotify.com',
+        'Referer': 'https://open.spotify.com/',
+        'app-platform': 'WebPlayer',
+        'spotify-app-version': '1.2.46.25.g7f189073'
       }
     });
 
-    const recordings = mbResponse.data?.recordings;
-    if (!recordings || recordings.length === 0) {
+    const tracks = response.data?.data?.searchV2?.tracksV2?.items;
+    if (!tracks || tracks.length === 0) {
       return res.status(404).json({ error: 'No results found' });
     }
 
-    // Find the first recording that has a Spotify URL relation
-    let spotifyTrackId = null;
-    for (const recording of recordings) {
-      const relations = recording['url-rels'] || [];
-      for (const rel of relations) {
-        const url = rel.url?.resource || '';
-        if (url.includes('open.spotify.com/track/')) {
-          spotifyTrackId = url.split('/track/')[1].split('?')[0];
-          break;
-        }
-      }
-      if (spotifyTrackId) break;
-    }
+    const firstTrack = tracks[0]?.item?.data;
+    const trackId = firstTrack?.uri?.split(':')[2];
 
-    // MusicBrainz basic search doesn't include url-rels, so fetch the first recording's details
-    if (!spotifyTrackId && recordings[0]?.id) {
-      const detailUrl = `https://musicbrainz.org/ws/2/recording/${recordings[0].id}?inc=url-rels&fmt=json`;
-      const detailResponse = await axios.get(detailUrl, {
-        headers: { 'User-Agent': 'Noog/1.0 ( noog@example.com )' }
-      });
-      const relations = detailResponse.data?.relations || [];
-      for (const rel of relations) {
-        const url = rel.url?.resource || '';
-        if (url.includes('open.spotify.com/track/')) {
-          spotifyTrackId = url.split('/track/')[1].split('?')[0];
-          break;
-        }
-      }
-    }
+    if (!trackId) return res.status(404).json({ error: 'No track ID found' });
 
-    if (!spotifyTrackId) {
-      console.log('No Spotify ID found on MusicBrainz for:', q);
-      return res.status(404).json({ error: 'No Spotify track ID found' });
-    }
+    console.log('Partner search found:', trackId, 'for:', q);
 
-    console.log('MusicBrainz found Spotify track ID:', spotifyTrackId, 'for:', q);
-
-    // Return in same format as Spotify search so the Android app needs no changes
     const result = {
       tracks: {
         items: [{
-          id: spotifyTrackId,
-          name: recordings[0]?.title || '',
-          artists: [{ name: recordings[0]?.['artist-credit']?.[0]?.name || '' }]
+          id: trackId,
+          name: firstTrack?.name || '',
+          artists: [{ name: firstTrack?.artists?.items?.[0]?.profile?.name || '' }]
         }]
       }
     };
@@ -93,7 +81,7 @@ app.get('/api/search', async (req, res) => {
     res.json(result);
 
   } catch (e) {
-    console.error('Search endpoint error:', e.response?.status, e.message);
+    console.error('Partner search error:', e.response?.status, e.response?.data, e.message);
     res.status(500).json({ error: e.message });
   }
 });
